@@ -1,6 +1,9 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
 from __future__ import print_function
+
+import time
+
 """
 
 get_image_size.py
@@ -30,6 +33,7 @@ class UnknownImageFormat(Exception):
 
 
 types = collections.OrderedDict()
+AVIF = types['AVIF'] = 'AVIF'
 BMP = types['BMP'] = 'BMP'
 GIF = types['GIF'] = 'GIF'
 ICO = types['ICO'] = 'ICO'
@@ -120,7 +124,7 @@ def get_image_metadata_from_bytesio(input, size, file_path=None):
     """
     height = -1
     width = -1
-    data = input.read(26)
+    data = input.read(28)
     msg = " raised while trying to decode as JPEG."
 
     if (size >= 10) and data[:6] in (b'GIF87a', b'GIF89a'):
@@ -253,7 +257,7 @@ def get_image_metadata_from_bytesio(input, size, file_path=None):
             chunk_header = input.read(8)
             if len(chunk_header) < 8:
                 raise UnknownImageFormat("Detected webp file but reached end of file without finding width and height metadata")
-            
+
             try:
                 chunk_header, chunk_size = struct.unpack('<4sI', chunk_header)
                 if chunk_header == b'VP8X':
@@ -282,6 +286,49 @@ def get_image_metadata_from_bytesio(input, size, file_path=None):
                     input.seek(chunk_size, 1)
             except (struct.error, ValueError):
                 raise UnknownImageFormat("Failed to parse image as webp. See cause exception for details")
+    elif (size >= 28) and data[4:8] == b'ftyp' and \
+            any(bytes(brand) in (b'avif', b'avis') for brand in zip(*((iter(data[8:]),) * 4))):
+        # Note: Only tested with outputs of imagemagik, GIMP and Krita
+        imgtype = AVIF
+        MSG = 'Failed to parse image as avif. '
+        FINDS = ('meta', 'iprp', 'ipco', 'ispe')
+        MAX_HEAD_SEARCH = 2 << 10  # Don't waste time if missed 'mdat' & it's processing mdat as part of the header
+        try:
+            header_size = struct.unpack('>I', data[0:4])[0]
+            input.seek(header_size, 0)
+
+            def _find(what, up_to_bytes):
+                while input.tell() < up_to_bytes:
+                    block_size_bytes = input.read(4)
+                    # https://docs.python.org/3/library/io.html#io.RawIOBase.read
+                    if block_size_bytes is None:
+                        time.sleep(0.1)
+                        continue
+                    if not block_size_bytes:
+                        raise UnknownImageFormat(MSG + "Reached end of file")
+
+                    block_size = struct.unpack('>I', block_size_bytes)[0]
+                    block_type = input.read(4).decode('ascii')
+                    if block_type == 'mdat':
+                        raise UnknownImageFormat(MSG + "Reached image data without finding '{}' data".format(FINDS[-1]))
+                    if block_type == what:
+                        return input.tell() + block_size
+
+                    input.seek(block_size - 8, 1)
+
+            sub_block_end = _find(FINDS[0], MAX_HEAD_SEARCH)
+            input.seek(4, 1)  # Jumping over meta's version and flags.
+            for find in FINDS[1:]:
+                sub_block_end = _find(find, sub_block_end)
+
+            input.seek(4, 1)  # Jumping over ispe's version and flags.
+            width = struct.unpack('>I', input.read(4))[0]
+            height = struct.unpack('>I', input.read(4))[0]
+
+        except struct.error:
+            raise UnknownImageFormat(MSG + "See cause exception for details")
+        except UnicodeDecodeError:
+            raise UnknownImageFormat(MSG + "Header name not ASCII convertible")
     elif size >= 2:
             # see http://en.wikipedia.org/wiki/ICO_(file_format)
         imgtype = 'ICO'
